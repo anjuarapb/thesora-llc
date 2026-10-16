@@ -1,0 +1,317 @@
+# Thesora Ops Portal MVP — Final Build Specification
+
+## Context
+
+Internal back-office web application for a US property-preservation contractor. Staff manage clients (national portals that send work orders), crews (1099 subcontractors who perform field work), and the work orders connecting them. Photos are legal evidence—deadlines are the highest operational priority. This is an MVP; background jobs, scrapers, and external integrations come in v1.
+
+## Tech Stack (Mandatory)
+
+- **Python 3.11+**
+- **NiceGUI** (UI framework)
+- **SQLAlchemy 2.0** + **Alembic** (ORM + migrations)
+- **PostgreSQL 16** via docker-compose (`app` + `postgres` services only)
+- **Pillow** (optional—document choice)
+- **No other frameworks**
+
+## Database Schema
+
+Build exactly these **10 tables**. All defaults must exist at the database DDL level (mirrored in ORM). Money columns use `numeric(12,2)`. All timestamps use `timestamptz` and display in **Asia/Dhaka** timezone.
+
+```sql
+clients (
+  id            serial PRIMARY KEY,
+  name          text NOT NULL,
+  portal_type   text,
+  payment_terms_days int DEFAULT 30,
+  price_sheet_notes text,
+  created_at    timestamptz DEFAULT now()
+);
+
+crews (
+  id            serial PRIMARY KEY,
+  name          text NOT NULL,
+  company_name  text,
+  phone         text,
+  whatsapp      text,
+  states_served text[] DEFAULT '{}',
+  zips_served   text[] DEFAULT '{}',
+  trades        text[] DEFAULT '{}',
+  rate_card     jsonb DEFAULT '{}',
+  coi_expires   date,
+  w9_on_file    boolean DEFAULT false,
+  rating        numeric(3,2) DEFAULT 3.0,
+  jobs_completed int DEFAULT 0,
+  on_time_pct   numeric(5,2) DEFAULT 100,
+  active        boolean DEFAULT true,
+  created_at    timestamptz DEFAULT now()
+);
+
+users (
+  id            serial PRIMARY KEY,
+  username      text UNIQUE NOT NULL,
+  password_hash text NOT NULL,
+  name          text
+);
+
+work_orders (
+  id              serial PRIMARY KEY,
+  client_id       int REFERENCES clients(id),
+  external_wo_no  text,
+  property_address text NOT NULL,
+  state           text,
+  zip             text,
+  task_type       text NOT NULL,
+  scope_text      text,
+  allowable_amount numeric(12,2),
+  bid_amount      numeric(12,2),
+  bid_status      text DEFAULT 'none',
+  deadline_at     timestamptz,
+  status          text NOT NULL DEFAULT 'created'
+                  CHECK (status IN ('created','assigned','in_progress',
+                                   'results_received','submitted',
+                                   'invoiced','paid','cancelled','chargeback')),
+  chargeback_flag boolean DEFAULT false,
+  created_at      timestamptz DEFAULT now()
+);
+
+wo_status_history (
+  id          serial PRIMARY KEY,
+  wo_id       int REFERENCES work_orders(id),
+  from_status text,
+  to_status   text NOT NULL,
+  changed_by  text,
+  changed_at  timestamptz DEFAULT now()
+);
+
+assignments (
+  id           serial PRIMARY KEY,
+  wo_id        int REFERENCES work_orders(id),
+  crew_id      int REFERENCES crews(id),
+  quoted_rate  numeric(12,2),
+  ended_at     timestamptz,
+  ended_reason text CHECK (ended_reason IN ('completed','reassigned')),
+  assigned_at  timestamptz DEFAULT now()
+);
+-- Partial unique index:
+CREATE UNIQUE INDEX idx_one_active_assignment ON assignments(wo_id) WHERE ended_at IS NULL;
+
+wo_photos (
+  id          serial PRIMARY KEY,
+  wo_id       int REFERENCES work_orders(id),
+  kind        text,
+  file_path   text NOT NULL,
+  exif_taken_at timestamptz,
+  exif_lat    numeric(10,7),
+  exif_lng    numeric(10,7),
+  qc_status   text DEFAULT 'pending',
+  uploaded_at timestamptz DEFAULT now()
+);
+
+wo_notes (
+  id         serial PRIMARY KEY,
+  wo_id      int REFERENCES work_orders(id),
+  author     text NOT NULL,
+  body       text NOT NULL,
+  created_at timestamptz DEFAULT now()
+);
+
+payments (
+  id         serial PRIMARY KEY,
+  crew_id    int REFERENCES crews(id),
+  batch_date date,
+  amount     numeric(12,2) NOT NULL,
+  method     text,
+  status     text DEFAULT 'pending'
+             CHECK (status IN ('pending','sent','cleared')),
+  created_at timestamptz DEFAULT now()
+);
+
+payment_items (
+  id         serial PRIMARY KEY,
+  payment_id int REFERENCES payments(id),
+  wo_id      int REFERENCES work_orders(id),
+  amount     numeric(12,2) NOT NULL
+);
+```
+
+## Work Order State Machine
+
+**Legal transitions:**
+- `created → assigned | cancelled`
+- `assigned → in_progress | cancelled`
+- `in_progress → results_received | cancelled`
+- `results_received → submitted`
+- `submitted → invoiced | chargeback`
+- `invoiced → paid | chargeback`
+
+**Service-layer invariants (same-transaction rules):**
+
+1. **`created → assigned` requires an assignment:** The transition and assignment row creation must happen atomically. A WO in `assigned` status must have an assignment row.
+
+2. **`in_progress → results_received` requires an active assignment:** Reject if no active assignment exists. When the transition succeeds, end the active assignment (`ended_at=now(), ended_reason='completed'`) in the same transaction.
+
+3. **Assignment creation rules:** New assignments are only legal while WO status is `created` or `assigned`. Reassignment (only while `assigned`): set old row `ended_reason='reassigned'`, create new row, same transaction. No assignments allowed after `results_received`.
+
+4. **Cost/payment lookup:** The crew and rate for job-cost calculations and payment batching come from the WO's **most recent assignment by `id`**, regardless of `ended_at`. The partial unique index only prevents double-dispatch.
+
+5. **Initial history:** Creating a WO writes an initial `wo_status_history` row (`NULL → created`). Seed data must follow this rule.
+
+**Implementation:** Enforce all transitions in a service layer function `transition(wo, to_status, user)`. Reject illegal transitions server-side even if the UI hides the button.
+
+## Payment Batching (Concurrency-Safe)
+
+The "Mark batch paid" action must:
+
+1. `SELECT ... FOR UPDATE` the selected WO rows (lock before reading status)
+2. Re-verify each locked WO is still `invoiced`—any deviation aborts the entire transaction (no partial batches)
+3. In the same transaction: create `payments(status='sent')` + `payment_items` rows, transition each WO `invoiced → paid`
+
+**Semantics:** WO status `paid` means payment was **sent**, not necessarily cleared. Display the payment row's status next to the WO status. Seed paid WOs with payment rows `status='sent'`.
+
+## Pages
+
+### 1. Dashboard (`/`)
+
+- Stat cards: count by status, overdue, due-in-48h, due-this-week, unassigned
+- "Needs attention" table: overdue or unassigned or due-within-48h, each row linking to the WO page
+- Recent activity feed (status changes, notes)
+- **All overdue/due counts and deadline lists exclude terminal statuses** (`paid`, `cancelled`, `chargeback`)
+
+### 2. Work Orders (`/workorders`)
+
+- Filterable table (status, client, state, crew, deadline window)
+- Search by address or external WO number
+- "New work order" dialog with all fields
+- Create/edit functionality
+
+### 3. Work Order Detail (`/workorders/{id}`)
+
+- All fields displayed and editable
+- **Status transition buttons rendered only for legal next states** (use FSM)
+- Status history timeline
+- Notes thread with add-note form
+- Photo upload:
+  - Accept jpg/jpeg/png only, 10 MB max
+  - Server-generated filenames: `{uuid}_{kind}.{ext}` preserving original extension
+  - Auth-only access
+  - **No delete capability in v0** (upload, tag, view only)
+  - Kind dropdown: before/after/address/closeup/other
+  - Thumbnail grid
+- Job-cost strip:
+  - Formula: `COALESCE(bid_amount, allowable_amount) − latest_assignment.quoted_rate`
+  - Label: **"estimated — materials not tracked; chargebacks excluded"**
+  - If both payout fields are NULL, display "estimate unavailable" (never zero)
+
+### 4. Crews (`/crews`)
+
+- Table with CRUD dialog
+- COI expiry cell shown in red when <14 days or expired
+- Crew detail page shows their WO history
+
+### 5. Deadlines Board (`/deadlines`)
+
+- All open WOs (nonterminal statuses with non-null deadline) sorted by `deadline_at`
+- Row color coding: overdue=red, <24h=orange, <48h=yellow
+- Row click opens the WO detail page
+
+### 6. Payments (`/payments`)
+
+- **Weekly batch preview:** All WOs with status `invoiced`, grouped by assigned crew, showing per-WO `quoted_rate` and sum per crew
+- **Exceptions list:** Invoiced WOs that cannot be batched:
+  - (a) No assignment
+  - (b) Latest assignment has NULL `quoted_rate`
+  - (c) Both `bid_amount` and `allowable_amount` are NULL
+  - All three cases listed, never silently dropped
+- "Mark batch paid" button (concurrency-safe per rules above)
+- Payment history list
+
+### 7. Clients
+
+- **Seed-only in v0** (2 clients in seed data)
+- Read-only reference in WO form dropdowns
+- No client CRUD page
+
+## Authentication
+
+- `users` table with `id, username, password_hash, name`
+- First boot generates a random admin password once, persists it to the database, prints to console once, never regenerates on restart
+- Provide CLI reset command: `python -m app.reset_admin` (requires shell access to VPS)
+
+## Seed Data
+
+- 2 clients (e.g., "DMG Pro", "MCS360")
+- 5 crews with varied trades/zips/COI expiry dates (include one expiring in 5 days)
+- 10 work orders spread across all 9 statuses
+- Every WO gets a **full legal-transition history chain** with realistic timestamp spacing (no jumps)
+- Paid WOs get matching `payments(status='sent')` + `payment_items` rows
+- Seeded statuses respect all invariants (e.g., `assigned` WOs have assignments; `results_received+` WOs have ended assignments with reason 'completed')
+
+## Tests (Milestone 1 Gate)
+
+All required to pass before proceeding to pages:
+
+**(a)** `created → assigned` fails without creating an assignment; succeeds only when the assignment is created in the same transaction.
+
+**(b)** `in_progress → results_received` fails when no active assignment exists; when it succeeds, the active assignment is ended (`ended_reason='completed'`) atomically with the transition.
+
+**(c)** Two concurrent batch-payment attempts against the same WO: exactly one succeeds, the other aborts with no partial state (simulate with two sessions/transactions).
+
+**Plus:**
+- Full FSM legal/illegal transition matrix
+- One end-to-end service test (create WO → assign crew → walk to paid)
+
+## README Requirements
+
+Must include:
+
+1. **Run instructions:** `docker compose up`, run migrations, run seed, open port 8080
+2. **Security note:** Internal tool behind VPN/SSH tunnel or firewall—never exposed to public internet without HTTPS (HTTPS is v1)
+3. **Backup/restore procedure:**
+   - Nightly: `docker compose exec -T postgres pg_dump -U thesora thesora | gzip > backups/thesora-$(date +%F).sql.gz` + rsync of `./data/photos/` to off-site storage
+   - Weekly: restore verification into scratch database (commands provided)
+   - Monthly: full restore drill (first drill before going live)
+4. **Operational notes:**
+   - "paid" on a work order means crew payment was sent; payment row reaching "cleared" confirms settlement
+   - Job-cost is an estimate (materials not tracked; chargebacks excluded)
+   - Staff must manually verify the company is licensed for the work order's state/trade before accepting work—the tool does not enforce this in v0
+
+## Storage Interface
+
+`storage.py` must expose:
+- `save_photo(wo_id, file, kind) -> path`
+- `list_photos(wo_id) -> list`
+
+Keep filesystem implementation behind this interface so it can be swapped for S3/MinIO in v1.
+
+## Build Milestones
+
+**Milestone 1 — Data core (gate: tests a/b/c pass)**
+- Docker Compose setup
+- SQLAlchemy models + Alembic migration
+- Seed script
+- FSM module with all tests
+
+**Milestone 2 — Pages (after M1 passes)**
+- All six pages with exact specifications above
+
+**Milestone 3 — Payments**
+- Job-cost strip on WO detail
+- Payment preview with exceptions list
+- Concurrency-safe batch payment
+
+## Do Not Build in v0
+
+- Scrapers
+- External API calls
+- SMS/Telegram notifications
+- MinIO (use filesystem via `storage.py` interface)
+- Scheduled background jobs
+- PDF generation
+- Photo deletion
+- Client CRUD
+- Multi-tenancy
+- Caddy/HTTPS
+
+## Implementation Guidance
+
+When ambiguous, choose the simplest option that preserves the schema, FSM, and invariant guarantees. Build in three milestones in order. Do not skip ahead.
